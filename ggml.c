@@ -4848,6 +4848,8 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.op           =*/ GGML_OP_NONE,
         /*.op_params    =*/ { 0 },
         /*.is_param     =*/ false,
+        /*.is_flushing  =*/ false,
+        /*.flush        =*/ NULL,
         /*.grad         =*/ NULL,
         /*.src          =*/ { NULL },
         /*.perf_runs    =*/ 0,
@@ -15702,11 +15704,38 @@ static void ggml_compute_forward_cross_entropy_loss_back(
     }
 }
 
+/////////////////////////////////
+
+static void ggml_flush_tensor(struct ggml_tensor * tensor) {
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        struct ggml_tensor * const src = tensor->src[i];
+        if (src == NULL) {
+            continue;
+        }
+        if (src->flush == NULL) {
+            continue;
+        }
+        bool false_ = false;
+        volatile _Atomic bool * is_flushing = (volatile _Atomic bool *) &src->is_flushing;
+        if (!atomic_compare_exchange_strong(is_flushing, &false_, true)) {
+            while (atomic_load(is_flushing)) {
+                sched_yield();
+            }
+            continue;
+        }
+        if (src->flush != NULL) {
+            src->flush(src);
+            src->flush = NULL;
+        }
+        atomic_store(is_flushing, false);
+    }
+}
 
 /////////////////////////////////
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
+    ggml_flush_tensor(tensor);
 
 #ifdef GGML_USE_CUBLAS
     bool skip_cpu = ggml_cuda_compute_forward(params, tensor);
@@ -17805,6 +17834,10 @@ int ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
             const int rc = ggml_thread_join(workers[j].thrd, NULL);
             GGML_ASSERT(rc == 0);
         }
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_flush_tensor(cgraph->nodes[i]);
     }
 
     // performance stats (graph)

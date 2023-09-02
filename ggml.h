@@ -471,6 +471,9 @@ extern "C" {
 
         bool is_param;
 
+        volatile bool is_flushing;
+        void (* flush)(struct ggml_tensor *);
+
         struct ggml_tensor * grad;
         struct ggml_tensor * src[GGML_MAX_SRC];
 
@@ -488,7 +491,7 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        char padding[4];
+        char padding[12];
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
