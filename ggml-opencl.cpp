@@ -1468,9 +1468,30 @@ void ggml_cl_mul_f32(const ggml_tensor * src0, const ggml_tensor * src1, ggml_te
             CL_CHECK(clReleaseEvent(h2d_ev));
         }
     }
-    CL_CHECK(clFinish(queue)); // block after starting all downloads instead of after each
-    r_pool.put(d_X, x_size);
-    w_pool.put(d_D, d_size);
+    cl_event read_ev;
+    CL_CHECK(clEnqueueMarkerWithWaitList(queue, 0, nullptr, &read_ev));
+    CL_CHECK(clFlush(queue));
+
+    struct Cleanup {
+        cl_event ev;
+        size_t x_size;
+        size_t d_size;
+        cl_mem d_X;
+        cl_mem d_D;
+        void run() {
+            CL_CHECK(clWaitForEvents(1, &ev));
+            CL_CHECK(clReleaseEvent(ev));
+            r_pool.put(d_X, x_size);
+            w_pool.put(d_D, d_size);
+        }
+        static void flush(ggml_tensor * dst) {
+            auto * cleanup = static_cast<Cleanup *>(dst->extra);
+            cleanup->run();
+            delete cleanup;
+        }
+    } * cleanup = new Cleanup{read_ev, x_size, d_size, d_X, d_D};
+    dst->extra = cleanup;
+    dst->flush = Cleanup::flush;
 }
 } // namespace
 
@@ -1557,13 +1578,36 @@ void ggml_cl_mul_mat_f32(const ggml_tensor * src0, const ggml_tensor * src1, ggm
             CL_CHECK(clReleaseEvent(ev_sgemm));
         }
     }
-    CL_CHECK(clFinish(queue)); // block after starting all downloads instead of after each
+    cl_event read_ev;
+    CL_CHECK(clEnqueueMarkerWithWaitList(queue, 0, nullptr, &read_ev));
+    CL_CHECK(clFlush(queue));
 
-    if (src0->backend != GGML_BACKEND_GPU) {
-        r_pool.put(d_X, x_size);
-    }
-    r_pool.put(d_Y, y_size);
-    w_pool.put(d_D, d_size);
+    struct Cleanup {
+        cl_event ev;
+        const ggml_tensor * src0;
+        size_t x_size;
+        size_t y_size;
+        size_t d_size;
+        cl_mem d_X;
+        cl_mem d_Y;
+        cl_mem d_D;
+        void run() {
+            CL_CHECK(clWaitForEvents(1, &ev));
+            CL_CHECK(clReleaseEvent(ev));
+            if (src0->backend != GGML_BACKEND_GPU) {
+                r_pool.put(d_X, x_size);
+            }
+            r_pool.put(d_Y, y_size);
+            w_pool.put(d_D, d_size);
+        }
+        static void flush(ggml_tensor * dst) {
+            auto * cleanup = static_cast<Cleanup *>(dst->extra);
+            cleanup->run();
+            delete cleanup;
+        }
+    } * cleanup = new Cleanup{read_ev, src0, x_size, y_size, d_size, d_X, d_Y, d_D};
+    dst->extra = cleanup;
+    dst->flush = Cleanup::flush;
 }
 
 void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, void * wdata, size_t /* wsize */) {
@@ -1587,8 +1631,6 @@ void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * src1, ggm
     const auto nb12 = static_cast<cl_int>(src1->nb[2]);
     const auto nb13 = static_cast<cl_int>(src1->nb[3]);
 
-    const auto nb2 = static_cast<cl_int>(dst->nb[2]);
-    const auto nb3 = static_cast<cl_int>(dst->nb[3]);
     const cl_int ne201 = ne11 * ne01;
     const cl_int ne2 = ne201 * ne023;
 
@@ -1688,23 +1730,57 @@ void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * src1, ggm
             CL_CHECK(clReleaseEvent(ev_sgemm));
         }
     }
+    cl_event read_ev;
+    CL_CHECK(clEnqueueMarkerWithWaitList(queue, 0, nullptr, &read_ev));
+    CL_CHECK(clFlush(queue));
 
-    // Wait for download, then convert everything at once to allow vectorization and avoid context switching
-    CL_CHECK(clFinish(queue));
-    for (cl_int i03 = 0; i03 < ne03; i03++) {
-        for (cl_int i02 = 0; i02 < ne02; i02++) {
-            // convert to float
-            ggml_fp16_t * const tmp = (ggml_fp16_t *) wdata + ne101 * (i03 * ne02 + i02);
-            auto * d = (float *) ((char *) dst->data + i02*nb2 + i03*nb3);
-            ggml_fp16_to_fp32_row(tmp, d, ne201);
+    // Defer the cleanup. Converting everything at once allows vectorization.
+    // The context switching does not impair cache performance because the data is from the GPU
+    struct Cleanup {
+        cl_event ev;
+        const ggml_tensor * src0;
+        const ggml_tensor * src1;
+        void * wdata;
+        size_t x_size;
+        size_t y_size;
+        size_t d_size;
+        cl_mem d_X;
+        cl_mem d_Y;
+        cl_mem d_D;
+        void run(ggml_tensor * dst) {
+            CL_CHECK(clWaitForEvents(1, &ev));
+            CL_CHECK(clReleaseEvent(ev));
+            const auto ne01 = static_cast<cl_int>(src0->ne[1]);
+            const auto ne02 = static_cast<cl_int>(src0->ne[2]);
+            const auto ne03 = static_cast<cl_int>(src0->ne[3]);
+            const auto ne10 = static_cast<cl_int>(src1->ne[0]);
+            const auto ne11 = static_cast<cl_int>(src1->ne[1]);
+            const auto nb2 = static_cast<cl_int>(dst->nb[2]);
+            const auto nb3 = static_cast<cl_int>(dst->nb[3]);
+            const cl_int ne101 = ne10 * ne11;
+            const cl_int ne201 = ne11 * ne01;
+            for (cl_int i03 = 0; i03 < ne03; i03++) {
+                for (cl_int i02 = 0; i02 < ne02; i02++) {
+                    // convert to float
+                    ggml_fp16_t * const tmp = (ggml_fp16_t *) wdata + ne101 * (i03 * ne02 + i02);
+                    auto * d = (float *) ((char *) dst->data + i02*nb2 + i03*nb3);
+                    ggml_fp16_to_fp32_row(tmp, d, ne201);
+                }
+            }
+            if (src0->backend != GGML_BACKEND_GPU) {
+                r_pool.put(d_X, x_size);
+            }
+            r_pool.put(d_Y, y_size);
+            w_pool.put(d_D, d_size);
         }
-    }
-
-    if (src0->backend != GGML_BACKEND_GPU) {
-        r_pool.put(d_X, x_size);
-    }
-    r_pool.put(d_Y, y_size);
-    w_pool.put(d_D, d_size);
+        static void flush(ggml_tensor * dst) {
+            auto * cleanup = static_cast<Cleanup *>(dst->extra);
+            cleanup->run(dst);
+            delete cleanup;
+        }
+    } * cleanup = new Cleanup{read_ev, src0, src1, wdata, x_size, y_size, d_size, d_X, d_Y, d_D};
+    dst->extra = cleanup;
+    dst->flush = Cleanup::flush;
 }
 
 void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -1736,7 +1812,7 @@ void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * src1, g
     size_t y_size{};
     size_t d_size{};
     size_t q_size{};
-    cl_mem d_X;
+    cl_mem d_X{};
     if (!mul_mat_vec) {
         d_X = rw_pool.get(ne0 * sizeof(float), &x_size);
     }
@@ -1842,16 +1918,46 @@ void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * src1, g
             }
         }
     }
-    CL_CHECK(clFinish(queue));
+    cl_event read_ev;
+    CL_CHECK(clEnqueueMarkerWithWaitList(queue, 0, nullptr, &read_ev));
+    CL_CHECK(clFlush(queue));
 
-    if (!mul_mat_vec) {
-        rw_pool.put(d_X, x_size);
+    if (mul_mat_vec) {
+        d_X = nullptr;
     }
-    r_pool.put(d_Y, y_size);
-    w_pool.put(d_D, d_size);
-    if (src0h2d) {
-        r_pool.put(d_Q, q_size);
+    if (!src0h2d) {
+        d_Q = nullptr;
     }
+    struct Cleanup {
+        cl_event ev;
+        size_t x_size;
+        size_t y_size;
+        size_t d_size;
+        size_t q_size;
+        cl_mem d_X;
+        cl_mem d_Y;
+        cl_mem d_D;
+        cl_mem d_Q;
+        void run() {
+            CL_CHECK(clWaitForEvents(1, &ev));
+            CL_CHECK(clReleaseEvent(ev));
+            if (d_X != nullptr) {
+                rw_pool.put(d_X, x_size);
+            }
+            r_pool.put(d_Y, y_size);
+            w_pool.put(d_D, d_size);
+            if (d_Q != nullptr) {
+                r_pool.put(d_Q, q_size);
+            }
+        }
+        static void flush(ggml_tensor * dst) {
+            auto * cleanup = static_cast<Cleanup *>(dst->extra);
+            cleanup->run();
+            delete cleanup;
+        }
+    } * cleanup = new Cleanup{read_ev, x_size, y_size, d_size, q_size, d_X, d_Y, d_D, d_Q};
+    dst->extra = cleanup;
+    dst->flush = Cleanup::flush;
 }
 } // namespace
 
