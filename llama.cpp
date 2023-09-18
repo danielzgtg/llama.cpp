@@ -3810,6 +3810,7 @@ static bool llama_eval_internal(
         ggml_graph_export(gf, cgraph_fname);
     }
 
+//#define GGML_PERF
 #ifdef GGML_PERF
     // print timing information per ggml operation (for debugging purposes)
     // requires GGML_PERF to be defined

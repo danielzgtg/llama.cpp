@@ -481,6 +481,9 @@ extern "C" {
 
         volatile bool is_flushing;
         void (* flush)(struct ggml_tensor *);
+        void * flush_data;
+        void (* cleanup)(struct ggml_tensor *);
+        void * cleanup_data;
 
         struct ggml_tensor * grad;
         struct ggml_tensor * src[GGML_MAX_SRC];
@@ -498,6 +501,7 @@ extern "C" {
         char name[GGML_MAX_NAME];
 
         void * extra; // extra things e.g. for ggml-cuda.cu
+        void * extra_sync;
 
         char padding[12];
     };

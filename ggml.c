@@ -124,7 +124,7 @@ typedef void * thread_ret_t;
 #endif
 #endif
 
-/*#define GGML_PERF*/
+#define GGML_PERF
 #define GGML_DEBUG 0
 #define GGML_GELU_FP16
 #define GGML_GELU_QUICK_FP16
@@ -4838,6 +4838,9 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.is_param     =*/ false,
         /*.is_flushing  =*/ false,
         /*.flush        =*/ NULL,
+        /*.flush_data   =*/ NULL,
+        /*.cleanup      =*/ NULL,
+        /*.cleanup_data =*/ NULL,
         /*.grad         =*/ NULL,
         /*.src          =*/ { NULL },
         /*.perf_runs    =*/ 0,
@@ -4848,6 +4851,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
+        /*.extra_sync   =*/ NULL,
         /*.padding      =*/ { 0 },
     };
 
@@ -15713,9 +15717,6 @@ static void ggml_flush_tensor(struct ggml_tensor * tensor) {
     atomic_store(is_flushing, false);
 }
 
-/////////////////////////////////
-
-
 static void ggml_flush_tensor_srcs(struct ggml_tensor * tensor) {
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         struct ggml_tensor *const src = tensor->src[i];
@@ -15726,11 +15727,38 @@ static void ggml_flush_tensor_srcs(struct ggml_tensor * tensor) {
     }
 }
 
+static bool ggml_flush_tensor_srcs_or_defer(struct ggml_tensor * tensor) {
+    switch (tensor->op) {
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+            break;
+        default:
+            ggml_flush_tensor_srcs(tensor);
+            return false;
+    }
+    bool needs_defer = false;
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        struct ggml_tensor *const src = tensor->src[i];
+        if (src == NULL) {
+            continue;
+        }
+        if (src->flush != NULL) {
+            needs_defer = true;
+            break;
+        }
+    }
+    if (!needs_defer) {
+        return true;
+    }
+    tensor->flush = ggml_flush_tensor_srcs;
+    return true;
+}
+
 /////////////////////////////////
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
-    ggml_flush_tensor_srcs(tensor);
+    bool can_defer = ggml_flush_tensor_srcs_or_defer(tensor);
 
 #ifdef GGML_USE_CUBLAS
     bool skip_cpu = ggml_cuda_compute_forward(params, tensor);
@@ -15741,6 +15769,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     GGML_ASSERT(tensor->src[1] == NULL || tensor->src[1]->backend == GGML_BACKEND_CPU);
 #endif // GGML_USE_CUBLAS
 
+    if (can_defer) {
+        return;
+    }
     switch (tensor->op) {
         case GGML_OP_DUP:
             {
@@ -17841,6 +17872,13 @@ int ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_flush_tensor(cgraph->nodes[i]);
+    }
+    for (int i = cgraph->n_nodes; i--;) {
+        struct ggml_tensor * tensor = cgraph->nodes[i];
+        if (tensor->cleanup) {
+            tensor->cleanup(tensor);
+            tensor->cleanup = NULL;
+        }
     }
 
     // performance stats (graph)

@@ -1330,7 +1330,7 @@ public:
 };
 ggml_cl_pool r_pool{CL_MEM_READ_ONLY | CL_MEM_HOST_WRITE_ONLY};
 ggml_cl_pool w_pool{CL_MEM_WRITE_ONLY | CL_MEM_HOST_READ_ONLY};
-ggml_cl_pool rw_pool{CL_MEM_READ_WRITE | CL_MEM_HOST_NO_ACCESS};
+ggml_cl_pool rw_pool{CL_MEM_READ_WRITE};
 } // namespace
 
 void ggml_cl_free_data(const struct ggml_tensor* tensor) {
@@ -1396,11 +1396,25 @@ void ggml_cl_mul_f32(const ggml_tensor * src0, const ggml_tensor * src1, ggml_te
     const auto nb2  = static_cast<cl_int>(dst->nb[2]);
     const auto nb3  = static_cast<cl_int>(dst->nb[3]);
     size_t x_size;
-    size_t d_size;
 
     cl_mem d_X = r_pool.get(ne0 * sizeof(float), &x_size); // src0
     auto* d_Y = static_cast<cl_mem>(src1->extra); // src1 is already on device, broadcasted.
-    cl_mem d_D = w_pool.get(ne0 * sizeof(float), &d_size); // dst
+    auto* d_D = static_cast<cl_mem>(dst->extra);
+    struct Cleanup {
+        static void cleanup(ggml_tensor * dst) {
+            rw_pool.put(static_cast<cl_mem>(dst->extra), reinterpret_cast<size_t>(dst->cleanup_data));
+            dst->extra = nullptr;
+            printf("%lu\n", reinterpret_cast<size_t>(dst->cleanup_data));
+        }
+    };
+    if (d_D == nullptr) {
+        size_t d_size;
+        d_D = rw_pool.get((ne02*nb2 + ne03*nb3) * sizeof(float), &d_size); // dst
+        dst->extra = d_D;
+        GGML_ASSERT(!dst->cleanup);
+        dst->cleanup_data = reinterpret_cast<void *>(d_size); // NOLINT
+        dst->cleanup = Cleanup::cleanup;
+    }
 
     for (cl_int i03 = 0; i03 < ne03; i03++) {
         for (cl_int i02 = 0; i02 < ne02; i02++) {
@@ -1472,26 +1486,30 @@ void ggml_cl_mul_f32(const ggml_tensor * src0, const ggml_tensor * src1, ggml_te
     CL_CHECK(clEnqueueMarkerWithWaitList(queue, 0, nullptr, &read_ev));
     CL_CHECK(clFlush(queue));
 
-    struct Cleanup {
-        cl_event ev;
+    struct Flush {
         size_t x_size;
-        size_t d_size;
         cl_mem d_X;
-        cl_mem d_D;
-        void run() {
+        void run(cl_event ev) const {
             CL_CHECK(clWaitForEvents(1, &ev));
             CL_CHECK(clReleaseEvent(ev));
             r_pool.put(d_X, x_size);
-            w_pool.put(d_D, d_size);
         }
         static void flush(ggml_tensor * dst) {
-            auto * cleanup = static_cast<Cleanup *>(dst->extra);
-            cleanup->run();
-            delete cleanup;
+            auto * flush = static_cast<Flush *>(dst->flush_data);
+            flush->run(static_cast<cl_event>(dst->extra_sync));
+            dst->extra_sync = nullptr;
+            delete flush;
         }
-    } * cleanup = new Cleanup{read_ev, x_size, d_size, d_X, d_D};
-    dst->extra = cleanup;
-    dst->flush = Cleanup::flush;
+    } * flush = new Flush{x_size, d_X};
+    GGML_ASSERT(!dst->extra_sync);
+    dst->extra_sync = read_ev;
+    dst->flush_data = flush;
+    dst->flush = Flush::flush;
+    // Disable everything as I just found out things will run out of memory this way
+    dst->flush(dst);
+    dst->flush = nullptr;
+    dst->cleanup(dst);
+    dst->cleanup = nullptr;
 }
 } // namespace
 
@@ -1582,7 +1600,7 @@ void ggml_cl_mul_mat_f32(const ggml_tensor * src0, const ggml_tensor * src1, ggm
     CL_CHECK(clEnqueueMarkerWithWaitList(queue, 0, nullptr, &read_ev));
     CL_CHECK(clFlush(queue));
 
-    struct Cleanup {
+    struct Flush {
         cl_event ev;
         const ggml_tensor * src0;
         size_t x_size;
@@ -1601,13 +1619,13 @@ void ggml_cl_mul_mat_f32(const ggml_tensor * src0, const ggml_tensor * src1, ggm
             w_pool.put(d_D, d_size);
         }
         static void flush(ggml_tensor * dst) {
-            auto * cleanup = static_cast<Cleanup *>(dst->extra);
-            cleanup->run();
-            delete cleanup;
+            auto * flush = static_cast<Flush *>(dst->flush_data);
+            flush->run();
+            delete flush;
         }
-    } * cleanup = new Cleanup{read_ev, src0, x_size, y_size, d_size, d_X, d_Y, d_D};
-    dst->extra = cleanup;
-    dst->flush = Cleanup::flush;
+    } * flush = new Flush{read_ev, src0, x_size, y_size, d_size, d_X, d_Y, d_D};
+    dst->flush_data = flush;
+    dst->flush = Flush::flush;
 }
 
 void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, void * wdata, size_t /* wsize */) {
@@ -1734,9 +1752,9 @@ void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * src1, ggm
     CL_CHECK(clEnqueueMarkerWithWaitList(queue, 0, nullptr, &read_ev));
     CL_CHECK(clFlush(queue));
 
-    // Defer the cleanup. Converting everything at once allows vectorization.
+    // Defer the flush. Converting everything at once allows vectorization.
     // The context switching does not impair cache performance because the data is from the GPU
-    struct Cleanup {
+    struct Flush {
         cl_event ev;
         const ggml_tensor * src0;
         const ggml_tensor * src1;
@@ -1774,13 +1792,13 @@ void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * src1, ggm
             w_pool.put(d_D, d_size);
         }
         static void flush(ggml_tensor * dst) {
-            auto * cleanup = static_cast<Cleanup *>(dst->extra);
-            cleanup->run(dst);
-            delete cleanup;
+            auto * flush = static_cast<Flush *>(dst->flush_data);
+            flush->run(dst);
+            delete flush;
         }
-    } * cleanup = new Cleanup{read_ev, src0, src1, wdata, x_size, y_size, d_size, d_X, d_Y, d_D};
-    dst->extra = cleanup;
-    dst->flush = Cleanup::flush;
+    } * flush = new Flush{read_ev, src0, src1, wdata, x_size, y_size, d_size, d_X, d_Y, d_D};
+    dst->flush_data = flush;
+    dst->flush = Flush::flush;
 }
 
 void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -1928,7 +1946,7 @@ void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * src1, g
     if (!src0h2d) {
         d_Q = nullptr;
     }
-    struct Cleanup {
+    struct Flush {
         cl_event ev;
         size_t x_size;
         size_t y_size;
@@ -1951,13 +1969,13 @@ void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * src1, g
             }
         }
         static void flush(ggml_tensor * dst) {
-            auto * cleanup = static_cast<Cleanup *>(dst->extra);
-            cleanup->run();
-            delete cleanup;
+            auto * flush = static_cast<Flush *>(dst->flush_data);
+            flush->run();
+            delete flush;
         }
-    } * cleanup = new Cleanup{read_ev, x_size, y_size, d_size, q_size, d_X, d_Y, d_D, d_Q};
-    dst->extra = cleanup;
-    dst->flush = Cleanup::flush;
+    } * flush = new Flush{read_ev, x_size, y_size, d_size, q_size, d_X, d_Y, d_D, d_Q};
+    dst->flush_data = flush;
+    dst->flush = Flush::flush;
 }
 } // namespace
 
