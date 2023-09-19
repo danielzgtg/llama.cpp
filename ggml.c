@@ -17819,6 +17819,43 @@ int ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
             }
         }
     }
+#if 0
+    FILE * f = fopen("../llama_debug_dot.md", "w");
+    fputs("```plantuml\n"
+         "digraph G{\n"
+         "beautify=true\n"
+         "layout=sfdp;\n"
+         "splines=line;\n"
+         "maxiter=1;"
+         "overlap=false;", f);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        cgraph->nodes[i]->perf_runs = i;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        struct ggml_tensor * tensor = cgraph->nodes[i];
+        struct ggml_tensor * view = tensor->view_src;
+        fprintf(f, "n%d [label=\"%d\\n%s\"];\n", i, i, GGML_OP_SYMBOL[tensor->op]);
+        if (view) {
+            int target = view->perf_runs;
+            if (target) { // Too many things point to node 0
+                fprintf(f, "n%d -> n%d [style=dashed];\n", i, target);
+            }
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            struct ggml_tensor * src = tensor->src[j];
+            if (!src) {
+                continue;
+            }
+            int target = src->perf_runs;
+            if (!target) { // Too many things point to node 0
+                continue;
+            }
+            fprintf(f, "n%d -> n%d;\n", i, target);
+        }
+    }
+    fputs("}\n```", f);
+    exit(1);
+#endif
 
     const int n_threads = cplan->n_threads;
 
