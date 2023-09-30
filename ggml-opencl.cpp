@@ -1404,7 +1404,7 @@ void ggml_cl_mul_f32(const ggml_tensor * src0, const ggml_tensor * src1, ggml_te
         static void cleanup(ggml_tensor * dst) {
             rw_pool.put(static_cast<cl_mem>(dst->extra), reinterpret_cast<size_t>(dst->cleanup_data));
             dst->extra = nullptr;
-            printf("%lu\n", reinterpret_cast<size_t>(dst->cleanup_data));
+//            printf("%lu\n", reinterpret_cast<size_t>(dst->cleanup_data));
         }
     };
     if (d_D == nullptr) {
